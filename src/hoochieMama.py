@@ -37,7 +37,7 @@ from aqt import mw
 from anki.utils import ids2str
 from aqt.utils import showText
 from anki.hooks import wrap
-from anki.sched import Scheduler
+from anki.schedv2 import Scheduler
 
 from anki import version
 ANKI21 = version.startswith("2.1.")
@@ -134,12 +134,12 @@ def getRevQueuePerSubDeck(self,sortBy,penetration):
     rev_queue = []
 
     if PRIORITIZE_TODAY:
-        dueToToday = self.col.db.list("""
+        dueToToday = self.col.db.all("""
     select id, did from cards where
     did in %s and queue = 2 and due = ?
     %s limit ?""" % (deck_list, sortBy),
                                       self.today, penetration)
-        dueToRest = self.col.db.list("""
+        dueToRest = self.col.db.all("""
     select id, did from cards where
     did in %s and queue = 2 and due < ?
     %s limit ?""" % (deck_list, sortBy),
@@ -148,7 +148,7 @@ def getRevQueuePerSubDeck(self,sortBy,penetration):
         rev_queue.extend(dueToRest)
 
     else:
-        rev_queue = self.col.db.list("""
+        rev_queue = self.col.db.all("""
     select id, did from cards where
     did in %s and queue = 2 and due <= ?
     %s limit ?""" % (deck_list, sortBy),
