@@ -7,6 +7,8 @@
 # Title is in reference to Seinfeld, no relations to the current slang term.
 
 # CONSTANTS:
+import math
+
 SHOW_YOUNG_FIRST="order by ivl asc"
 SHOW_MATURE_FIRST="order by ivl desc"
 SHOW_LOW_REPS_FIRST="order by reps asc"
@@ -47,15 +49,51 @@ ANKI21 = version.startswith("2.1.")
 on_sync = False
 
 
-# Turn this on if you are having problems.
-def debugInfo(msg):
-    # print(msg) #console
-    # showText(msg) #Windows
-    return
+def deckRevLimitSingle(self, deck, parentLimit=None, *, _old):
+    qc = self.col.conf
+    if not qc.get("hoochieMama", False):
+        return _old(self, deck, parentLimit)
+
+    if IMPOSE_SUBDECK_LIMIT:
+        from anki.sched import Scheduler
+        return Scheduler._deckRevLimitSingle(self, deck)
+    else:
+        return _old(self, deck, parentLimit)
 
 
 # From: anki.schedv2.py
-# Mod:  Various, see logs
+def answerRevCard(self, card, ease, *, _old):
+    qc = self.col.conf
+    if not qc.get("hoochieMama", False):
+        return _old(self, card, ease)
+
+    delay = 0
+    early = card.odid and (card.odue > self.today)
+    type = early and 3 or 1
+
+    if not early:
+        # We shouldn't update any factors when early review happens
+        card.factor = _newFactor(self, card, ease)
+
+    if ease == 1:
+        delay = _rescheduleLapse(self, card)
+    else:
+        _rescheduleRev(self, card, ease, early)
+
+    self._logRev(card, ease, delay, type)
+
+
+# From: anki.schedv2.py
+def nextRevIvl(self, card, ease, fuzz, *, _old):
+    qc = self.col.conf
+    if not qc.get("hoochieMama", False):
+        return _old(self, card, ease, fuzz)
+
+    new_factor = _newFactor(self, card, ease)
+    return self._constrainedIvl(card.ivl * new_factor / 1000, self._revConf(card), card.ivl / (card.factor / 1000), fuzz)
+
+
+# From: anki.schedv2.py
 def fillRev(self, _old):
     if self._revQueue:
         return True
@@ -72,16 +110,15 @@ def fillRev(self, _old):
     qc = self.col.conf
     if not qc.get("hoochieMama", False):
         return _old(self)
-    debugInfo('using hoochieMama')
 
     lim = Scheduler._currentRevLimit(self)
     if lim:
         lim = min(self.queueLimit, lim)
         sort_by = CUSTOM_SORT if CUSTOM_SORT else SORT_BY_OVERDUES
         if IMPOSE_SUBDECK_LIMIT:
-            self._revQueue = getRevQueuePerSubDeck(self, sort_by, lim)
+            self._revQueue = get_rev_queue_per_subdeck(self, sort_by, lim)
         else:
-            self._revQueue = getRevQueue(self, sort_by, lim)
+            self._revQueue = _get_rev_queue(self, sort_by, lim)
 
         if self._revQueue:
             if CUSTOM_SORT and not IMPOSE_SUBDECK_LIMIT:
@@ -100,10 +137,97 @@ def fillRev(self, _old):
         return self._fillRev()
 
 
+def _newFactor(self, card, ease):
+    # R = e ** (-k * t/S)
+    # R for t == s should be `good` == 0.93
+    # Therefor -k = ln(0.93)
+
+    easy_lower = 0.96
+    good_lower = 0.90
+    hard_lower = 0.82
+
+    k = math.log(2/(easy_lower + good_lower))
+
+    delayed_by = self._daysLate(card)
+    total_time = card.ivl + delayed_by
+    predicted_R = math.exp(-k * total_time / card.ivl)
+
+    if predicted_R > easy_lower:
+        predicted_ease = 4
+    elif predicted_R > good_lower:
+        predicted_ease = 3
+    elif predicted_R > hard_lower:
+        predicted_ease = 2
+    else:
+        predicted_ease = 1
+
+    if predicted_ease == ease:
+        return card.factor
+    elif predicted_ease > ease:
+        if ease == 3:
+            p = math.log(easy_lower)
+        elif ease == 2:
+            p = math.log(good_lower)
+        else:  # ease == 1
+            p = math.log(hard_lower)
+    else:  # predicted_ease < ease:
+        if ease == 4:
+            p = math.log(easy_lower)
+        elif ease == 3:
+            p = math.log(good_lower)
+        else:  # ease == 2:
+            p = math.log(hard_lower)
+    # p = -k * total_time / corrected_ivl
+    corrected_ivl = -k * total_time / p
+
+    ivl_power = math.log(card.ivl * card.factor) / math.log(card.factor/1000)
+    factor_multiplier = (corrected_ivl / card.ivl) ** (1 / (ivl_power ** 0.1))
+    factor = int(card.factor * factor_multiplier)
+    factor = max(1300, factor)
+    factor = min(10000, factor)
+    return factor
+
+
+# From: anki.schedv2.py
+def _rescheduleRev(self, card, ease, early):
+    # update interval
+    card.lastIvl = card.ivl
+    if early:
+        self._updateEarlyRevIvl(card, ease)
+    else:
+        self.ivl = self._constrainedIvl(card.ivl * card.factor / 1000, self._revConf(card), card.lastIvl / (card.factor / 1000), fuzz=True)
+
+    card.due = self.today + card.ivl
+
+    # card leaves filtered deck
+    self._removeFromFiltered(card)
+
+
+# From: anki.schedv2.py
+def _rescheduleLapse(self, card):
+    conf = self._lapseConf(card)
+
+    card.lapses += 1
+    suspended = self._checkLeech(card, conf) and card.queue == -1
+
+    if conf['delays'] and not suspended:
+        card.type = 3
+        delay = self._moveToFirstStep(card, conf)
+    else:
+        # no relearning steps
+        self._updateRevIvlOnFail(card, conf)
+        self._rescheduleAsRev(card, conf, early=False)
+        # need to reset the queue after rescheduling
+        if suspended:
+            card.queue = -1
+        delay = 0
+
+    return delay
+
+
 # In the world of blackjack, “penetration”, or “deck penetration”,
 # is the amount of cards that the dealer cuts off, relative to the cards dealt out.
-def getRevQueue(self, sortBy, penetration):
-    debugInfo('v2 queue builder')
+def _get_rev_queue(self, sort_by, penetration):
     deck_list = ids2str(self.col.decks.active())
     rev_queue = []
 
@@ -111,8 +235,8 @@ def getRevQueue(self, sortBy, penetration):
         dueToToday = self.col.db.list("""
 select id from cards where
 did in %s and queue = 2 and due = ?
-%s limit ?""" % (deck_list, sortBy),
-                self.today, penetration)
+%s limit ?""" % (deck_list, sort_by),
+                                      self.today, penetration)
         rev_queue.extend(dueToToday)
         penetration -= len(dueToToday)
 
@@ -138,15 +262,14 @@ order by (? - due) / ivl limit ?""" % (deck_list, excluded_ids),
     dueToRest = self.col.db.list("""
 select id from cards where
 did in %s and id not in %s and queue = 2 and due <= ?
-%s limit ?""" % (deck_list, excluded_ids, sortBy),
-            self.today, penetration)
+%s limit ?""" % (deck_list, excluded_ids, sort_by),
+                                 self.today, penetration)
     rev_queue.extend(dueToRest)
 
     return rev_queue  # Order needs tobe reversed for custom sorts
 
 
-def getRevQueuePerSubDeck(self,sortBy,penetration):
-    debugInfo('per subdeck queue builder')
+def get_rev_queue_per_subdeck(self, sort_by, penetration):
     deck_list = ids2str(self.col.decks.active())
     rev_queue = []
 
@@ -154,8 +277,8 @@ def getRevQueuePerSubDeck(self,sortBy,penetration):
         dueToToday = self.col.db.all("""
     select id, did from cards where
     did in %s and queue = 2 and due = ?
-    %s limit ?""" % (deck_list, sortBy),
-                                      self.today, penetration)
+    %s limit ?""" % (deck_list, sort_by),
+                                     self.today, penetration)
         rev_queue.extend(dueToToday)
         penetration -= len(dueToToday)
 
@@ -181,8 +304,8 @@ def getRevQueuePerSubDeck(self,sortBy,penetration):
     dueToRest = self.col.db.all("""
     select id, did from cards where
     did in %s and id not in %s and queue = 2 and due <= ?
-    %s limit ?""" % (deck_list, excluded_ids, sortBy),
-                                 self.today, penetration)
+    %s limit ?""" % (deck_list, excluded_ids, sort_by),
+                                self.today, penetration)
     rev_queue.extend(dueToRest)
 
     limited_rev_queue = []
@@ -208,7 +331,7 @@ def getRevQueuePerSubDeck(self,sortBy,penetration):
             decks_used_limits[parent['id']] += 1
 
     if not limited_rev_queue and rev_queue:
-        return getRevQueuePerSubDeck(self, sortBy, penetration * 2)[:penetration]
+        return get_rev_queue_per_subdeck(self, sort_by, penetration * 2)[:penetration]
 
     return limited_rev_queue
 
@@ -221,19 +344,13 @@ def _deckRevLimit(self, d):
     return max(0, c['rev']['perDay'] - d['revToday'][1])
 
 
-def deckRevLimitSingle(self, deck, parentLimit=None, *, _old):
-    if IMPOSE_SUBDECK_LIMIT:
-        from anki.sched import Scheduler
-        return Scheduler._deckRevLimitSingle(self, deck)
-    else:
-        return _old(self, deck, parentLimit)
-
-
 anki.sched.Scheduler._fillRev = wrap(anki.sched.Scheduler._fillRev, fillRev, 'around')
 if ANKI21:
     import anki.schedv2
     anki.schedv2.Scheduler._deckRevLimitSingle = wrap(anki.schedv2.Scheduler._deckRevLimitSingle, deckRevLimitSingle, 'around')
     anki.schedv2.Scheduler._fillRev = wrap(anki.schedv2.Scheduler._fillRev, fillRev, 'around')
+    anki.schedv2.Scheduler._answerRevCard = wrap(anki.schedv2.Scheduler._answerRevCard, answerRevCard, 'around')
+    anki.schedv2.Scheduler._nextRevIvl = wrap(anki.schedv2.Scheduler._nextRevIvl, nextRevIvl, 'around')
 
 
 # This monitor sync start/stops
