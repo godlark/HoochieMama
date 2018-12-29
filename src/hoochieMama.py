@@ -180,8 +180,8 @@ def _newFactor(self, card, ease):
     # p = -k * total_time / corrected_ivl
     corrected_ivl = -k * total_time / p
 
-    ivl_power = math.log(card.ivl * card.factor) / math.log(card.factor/1000)
-    factor_multiplier = (corrected_ivl / card.ivl) ** (1 / (ivl_power ** 0.1))
+    ivl_power = math.log(card.ivl * (card.factor / 1000)) / math.log(card.factor / 1000)
+    factor_multiplier = (corrected_ivl / card.ivl) ** (1 / (ivl_power ** 0.37037))
     factor = int(card.factor * factor_multiplier)
     factor = max(1300, factor)
     factor = min(10000, factor)
