@@ -71,6 +71,7 @@ def answerRevCard(self, card, ease, *, _old):
     early = card.odid and (card.odue > self.today)
     type = early and 3 or 1
 
+    card.lastFactor = card.factor
     if not early:
         # We shouldn't update any factors when early review happens
         card.factor = _newFactor(self, card, ease)
@@ -139,12 +140,12 @@ def fillRev(self, _old):
 
 def _newFactor(self, card, ease):
     # R = e ** (-k * t/S)
-    # R for t == s should be `good` == 0.93
-    # Therefor -k = ln(0.93)
+    # R for t == s should be `good` == 0.90
+    # Therefor -k = ln(0.90)
 
-    easy_lower = 0.96
-    good_lower = 0.90
-    hard_lower = 0.82
+    easy_lower = 0.95
+    good_lower = 0.85
+    hard_lower = 0.75
 
     k = math.log(2/(easy_lower + good_lower))
 
@@ -195,7 +196,7 @@ def _rescheduleRev(self, card, ease, early):
     if early:
         self._updateEarlyRevIvl(card, ease)
     else:
-        self.ivl = self._constrainedIvl(card.ivl * card.factor / 1000, self._revConf(card), card.lastIvl / (card.factor / 1000), fuzz=True)
+        card.ivl = self._constrainedIvl(card.ivl * card.factor / 1000, self._revConf(card), card.lastIvl / (card.factor / 1000), fuzz=True)
 
     card.due = self.today + card.ivl
 
@@ -209,6 +210,9 @@ def _rescheduleLapse(self, card):
 
     card.lapses += 1
     suspended = self._checkLeech(card, conf) and card.queue == -1
+
+    card.lastIvl = card.ivl
+    card.ivl = card.ivl * card.factor / card.lastFactor
 
     if conf['delays'] and not suspended:
         card.type = 3
